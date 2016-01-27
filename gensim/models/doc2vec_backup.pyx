@@ -16,6 +16,7 @@ from numpy import zeros, float32 as REAL
 cimport numpy as np
 
 from libc.math cimport exp
+from libc.math cimport sqrt, pow, isnan
 from libc.string cimport memset, memcpy
 
 # scipy <= 0.15
@@ -36,7 +37,9 @@ from word2vec import FAST_VERSION
 DEF MAX_DOCUMENT_LEN = 10000
 
 cdef int ONE = 1
+cdef REAL_t ZEROS = <REAL_t>0.0
 cdef REAL_t ONEF = <REAL_t>1.0
+cdef REAL_t ONEFM = <REAL_t> -1.0
 
 DEF EXP_TABLE_SIZE = 1000
 DEF MAX_EXP = 6
@@ -45,13 +48,25 @@ cdef void fast_document_dbow_hs(
     const np.uint32_t *word_point, const np.uint8_t *word_code, const int codelen,
     REAL_t *context_vectors, REAL_t *syn1, const int size,
     const np.uint32_t context_index, const REAL_t alpha, REAL_t *work, int learn_context, int learn_hidden,
-    REAL_t *context_locks) nogil:
+    REAL_t *context_locks, const REAL_t adam_lr, const REAL_t adam_beta1, const REAL_t adam_beta2, const REAL_t adam_eps, REAL_t *adam_m, REAL_t *adam_v, REAL_t *adam_m2, REAL_t *adam_v2):
 
     cdef long long a, b
     cdef long long row1 = context_index * size, row2
+    cdef long long adam_index = ONE - ONE
+    cdef long long adam_index2 = ONE
     cdef REAL_t f, g
-
-    memset(work, 0, size * cython.sizeof(REAL_t))
+    # Adam
+    cdef REAL_t adam_grad_base, adam_m_syn1, adam_v_syn1, adam_m_context, adam_v_context
+    cdef REAL_t adam_grad_syn1_top
+    cdef REAL_t adam_grad_context_top
+    cdef REAL_t *adam_update_syn1
+    cdef REAL_t *adam_update_context
+    cdef REAL_t *adam_grad_syn1
+    cdef REAL_t *adam_grad
+    cdef REAL_t *adam_grad_context
+    cdef REAL_t *adam_v_sqrt
+    cdef REAL_t update_element
+    memset(work, 0, ONE * cython.sizeof(REAL_t))
     for b in range(codelen):
         row2 = word_point[b] * size
         f = our_dot(&size, &context_vectors[row1], &ONE, &syn1[row2], &ONE)
@@ -59,18 +74,139 @@ cdef void fast_document_dbow_hs(
             continue
         f = EXP_TABLE[<int>((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]
         g = (1 - word_code[b] - f) * alpha
+
+
+
+        # Adam
+        adam_grad_syn1 = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_syn1 init
+        adam_grad_base = (1 - word_code[b] - f)
+        our_saxpy(&size, &adam_grad_base, &syn1[row2], &ONE, adam_grad_syn1, &ONE) # adam_grad_syn1 = adam_grad_base * syn1[row2]
+        # m += (1 - self.beta1) * (grad - m)
+        our_saxpy(&size, &ONEFM, adam_m, &ONE, adam_grad_syn1, &ONE)
+        adam_grad_syn1_top = (ONEF - adam_beta1)
+        our_saxpy(&size, &ONEF, &adam_grad_syn1_top, &ONE, adam_grad_syn1, &ONE)
+        our_saxpy(&size, &ONEF, adam_grad_syn1, &ONE, adam_m, &ONE)
+
+
+        # adam_m_syn1 = (ONEF - adam_beta1) * (adam_grad_syn1 - adam_m[0])
+        # print(adam_m)
+
+
+        adam_grad_syn1 = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_syn1 init
+        adam_grad = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_syn1 init
+        # v += (1 - self.beta2) * (grad * grad - v)
+        our_saxpy(&size, &adam_grad_base, &context_vectors[row1], &ONE, adam_grad, &ONE) 
+        # v += (1 - self.beta2) * (grad * grad - v)
+        # grad * grad
+        for i in range(size):
+            update_element = <REAL_t> adam_grad[i] * adam_grad[i]
+            our_saxpy(&ONE, &ONEF, &update_element, &ONE, &adam_grad_syn1[i], &ONE)
+
+        # our_saxpy(&size, adam_grad_syn1, adam_grad_syn1, &ONE, adam_grad_syn1, &ONE) # grad * grad
+        our_saxpy(&size, &ONEFM, adam_v, &ONE, adam_grad_syn1, &ONE) # grad * grad - v
+        adam_grad_syn1_top = (ONEF - adam_beta2)
+        our_saxpy(&size, &ONEF, &adam_grad_syn1_top, &ONE, adam_grad_syn1, &ONE)
+        our_saxpy(&size, &ONEF, adam_grad_syn1, &ONE, adam_v, &ONE)
+
+        # our_saxpy(&size, &ONEF, &adam_m, &ONE, &adam_m_syn1, &ONE)
+        # our_saxpy(&size, &ONEFM, &adam_v, &ONE, &adam_v_syn1, &ONE)
+        # adam_v_syn1 = (ONEF - adam_beta2) * adam_v_syn1
+        # # adam_v_syn1 = (ONEF - adam_beta2) * ((adam_grad_syn1*adam_grad_syn1) - adam_v)
+        
+        # data -= self.lr * m / (numpy.sqrt(v) + self.eps)
+        adam_update_syn1 = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_syn1 init
+        # np.sqrt(adam_v[0])
+        for i in range(size):
+            # param.data -= self.lr * m / (numpy.sqrt(v) + self.eps)
+            if isnan(adam_m[i]):
+                adam_m[i] = <REAL_t> 0.0
+            if isnan(adam_v[i]):
+                adam_v[i] = <REAL_t> 0.0
+            update_element = <REAL_t> ((adam_lr * adam_m[i]) / (sqrt(adam_v[i]) + adam_eps))
+            if isnan(update_element):
+                update_element = <REAL_t> 0.0
+            # work[i] += update_element
+
+
+            # our_saxpy(&ONE, &ONEF, &update_element, &ONE, &adam_update_syn1[i], &ONE)
+            # print adam_m[i]
+            # v_sqrt = <REAL_t> (adam_lr * adam_m[i]) / (sqrt(adam_v[i]) + adam_eps)
+            # our_saxpy(&ONE, &v_sqrt, &adam_update_syn1[i], &ONE, &adam_update_syn1[i], &ONE)
+        # our_saxpy(&size, &ONEF, adam_update_syn1, &ONE, work, &ONE)
+
+        # adam_update_syn1 = (adam_lr * adam_m_syn1) / (sqrt(adam_v_syn1) + adam_eps)
+        # our_saxpy(&size, &ONEF, &adam_update_syn1, &ONE, work, &ONE)
+        # our_saxpy(&size, &ONEF, &adam_m_syn1, &ONE, adam_m, &ONE)
+        # our_saxpy(&size, &ONEF, &adam_m_syn1, &ONE, adam_v, &ONE)
+        # dsdot(&size, x, &ONE, y, &ONE)
+
+
+        # SGD
         our_saxpy(&size, &g, &syn1[row2], &ONE, work, &ONE)
         if learn_hidden:
+
+            adam_grad_context = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_context init
+            our_saxpy(&size, &adam_grad_base, &context_vectors[row1], &ONE, adam_grad_context, &ONE) 
+            # adam_grad_context = adam_grad_base * syn1[row2]
+            # m += (1 - self.beta1) * (grad - m)
+            our_saxpy(&size, &ONEFM, adam_m2, &ONE, adam_grad_context, &ONE)
+            adam_grad_context_top = (ONEF - adam_beta1)
+            our_saxpy(&size, &ONEF, &adam_grad_context_top, &ONE, adam_grad_context, &ONE)
+            our_saxpy(&size, &ONEF, adam_grad_context, &ONE, adam_m2, &ONE)
+
+
+            adam_grad_context = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_syn1 init
+            adam_grad = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_syn1 init
+            our_saxpy(&size, &adam_grad_base, &context_vectors[row1], &ONE, adam_grad, &ONE) 
+            # v += (1 - self.beta2) * (grad * grad - v)
+            # grad * grad
+            for i in range(size):
+                update_element = <REAL_t> adam_grad[i] * adam_grad[i]
+                our_saxpy(&ONE, &ONEF, &update_element, &ONE, &adam_grad_context[i], &ONE)
+            # our_saxpy(&size, adam_grad_context, adam_grad_context, &ONE, adam_grad_context, &ONE) 
+            # print adam_grad_context[0]
+            our_saxpy(&size, &ONEFM, adam_v2, &ONE, adam_grad_context, &ONE) # grad * grad - v
+            adam_grad_context_top = (ONEF - adam_beta2)
+            our_saxpy(&size, &ONEF, &adam_grad_context_top, &ONE, adam_grad_context, &ONE)
+            our_saxpy(&size, &ONEF, adam_grad_context, &ONE, adam_v2, &ONE)
+
+            # param.data -= self.lr * m / (numpy.sqrt(v) + self.eps)
+            adam_update_context = <REAL_t *>np.PyArray_DATA(zeros(size, dtype=REAL)) # adam_grad_syn1 init
+            for i in range(size):
+                if isnan(adam_m2[i]):
+                    adam_m2[i] = <REAL_t> 0.0
+                if isnan(adam_v2[i]):
+                    adam_v2[i] = <REAL_t> 0.0
+                update_element = <REAL_t> ((adam_lr * adam_m2[i]) / (sqrt(adam_v2[i]) + adam_eps))
+                # CHECK TODO: -=じゃなくていいのか
+                if isnan(update_element):
+                    update_element = <REAL_t> 0.0
+
+                # our_saxpy(&ONE, &ONEF, &update_element, &ONE, &syn1[row2+i], &ONE)
+
+
+            # adam_grad_context = adam_grad_base * context_vectors[row1]
+            # adam_m_context = (ONEF - adam_beta1) * (adam_grad_context - adam_m2)
+            # adam_v_context = (ONEF - adam_beta2) * ((adam_grad_context*adam_grad_context) - adam_v2)
+            # adam_update_context = (adam_lr * adam_m_context) / (sqrt(adam_v_context) + adam_eps)
+            # our_saxpy(&size, &ONEF, &adam_update_context, &ONE, &syn1[row2], &ONE)
+            # our_saxpy(&size, &ONEF, &adam_m_context, &ONE, adam_m2, &ONE)
+            # our_saxpy(&size, &ONEF, &adam_v_context, &ONE, adam_v2, &ONE)
+
+            # SGD
             our_saxpy(&size, &g, &context_vectors[row1], &ONE, &syn1[row2], &ONE)
     if learn_context:
         our_saxpy(&size, &context_locks[context_index], work, &ONE, &context_vectors[row1], &ONE)
+        # SGD
+        # our_saxpy(&size, &context_locks[context_index], work, &ONE, &context_vectors[row1], &ONE)
+
 
 
 cdef unsigned long long fast_document_dbow_neg(
     const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len,
     REAL_t *context_vectors, REAL_t *syn1neg, const int size, const np.uint32_t word_index,
     const np.uint32_t context_index, const REAL_t alpha, REAL_t *work,
-    unsigned long long next_random, int learn_context, int learn_hidden, REAL_t *context_locks) nogil:
+    unsigned long long next_random, int learn_context, int learn_hidden, REAL_t *context_locks, const REAL_t adam_lr, const REAL_t adam_beta1, const REAL_t adam_beta2, const REAL_t adam_eps, REAL_t *adam_m, REAL_t *adam_v, REAL_t *adam_m2, REAL_t *adam_v2) nogil:
 
     cdef long long a
     cdef long long row1 = context_index * size, row2
@@ -246,6 +382,28 @@ def train_document_dbow(model, doc_words, doctag_indexes, alpha, work=None,
     cdef REAL_t _alpha = alpha
     cdef int size = model.layer1_size
 
+    # Adam
+    cdef REAL_t adam_fix1 = ONEF - model.adam_beta1 ** model.adam_t
+    cdef REAL_t adam_fix2 = ONEF - model.adam_beta2 ** model.adam_t
+    cdef REAL_t adam_lr = _alpha * sqrt(adam_fix2) / adam_fix1
+    cdef REAL_t adam_beta1 = model.adam_beta1
+    cdef REAL_t adam_beta2 = model.adam_beta2
+    cdef REAL_t adam_eps = model.adam_eps
+    model.adam_t += ONEF
+    cdef REAL_t *adam_m
+    cdef REAL_t *adam_v
+    cdef REAL_t *adam_m2
+    cdef REAL_t *adam_v2
+    adam_m = <REAL_t *>(np.PyArray_DATA(model.adam_m))
+    adam_v = <REAL_t *>(np.PyArray_DATA(model.adam_v))
+    adam_m2 = <REAL_t *>(np.PyArray_DATA(model.adam_m2))
+    adam_v2 = <REAL_t *>(np.PyArray_DATA(model.adam_v2))
+    # print 'adam_lr:', adam_lr
+    # print 'adam_m :', model.adam_m, model.adam_m2
+    # print 'adam_v :', model.adam_v, model.adam_v2
+
+
+
     cdef int codelens[MAX_DOCUMENT_LEN]
     cdef np.uint32_t indexes[MAX_DOCUMENT_LEN]
     cdef np.uint32_t _doctag_indexes[MAX_DOCUMENT_LEN]
@@ -344,37 +502,37 @@ def train_document_dbow(model, doc_words, doctag_indexes, alpha, work=None,
         result += 1
 
     # release GIL & train on the document
-    with nogil:
-        for i in range(document_len):
-            if _train_words:  # simultaneous skip-gram wordvec-training
-                j = i - window + reduced_windows[i]
-                if j < 0:
-                    j = 0
-                k = i + window_r + 1 - reduced_windows_r[i]
-                if k > document_len:
-                    k = document_len
-                for j in range(j, k):
-                    if j == i:
-                        continue
-                    if hs:
-                        # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
-                        fast_document_dbow_hs(points[i], codes[i], codelens[i], _word_vectors, syn1, size, indexes[j],
-                                              _alpha, _work, _learn_words, _learn_hidden, _word_locks)
-                    if negative:
-                        # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
-                        next_random = fast_document_dbow_neg(negative, cum_table, cum_table_len, _word_vectors, syn1neg, size,
-                                                             indexes[i], indexes[j], _alpha, _work, next_random,
-                                                             _learn_words, _learn_hidden, _word_locks)
-
-            # docvec-training
-            for j in range(doctag_len):
+    # with nogil:
+    for i in range(document_len):
+        if _train_words:  # simultaneous skip-gram wordvec-training
+            j = i - window + reduced_windows[i]
+            if j < 0:
+                j = 0
+            k = i + window_r + 1 - reduced_windows_r[i]
+            if k > document_len:
+                k = document_len
+            for j in range(j, k):
+                if j == i:
+                    continue
                 if hs:
-                    fast_document_dbow_hs(points[i], codes[i], codelens[i], _doctag_vectors, syn1, size, _doctag_indexes[j],
-                                          _alpha, _work, _learn_doctags, _learn_hidden, _doctag_locks)
+                    # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
+                    fast_document_dbow_hs(points[i], codes[i], codelens[i], _word_vectors, syn1, size, indexes[j],
+                                          _alpha, _work, _learn_words, _learn_hidden, _word_locks, adam_lr, adam_beta1, adam_beta2, adam_eps, adam_m, adam_v, adam_m2, adam_v2)
                 if negative:
-                    next_random = fast_document_dbow_neg(negative, cum_table, cum_table_len, _doctag_vectors, syn1neg, size,
-                                                             indexes[i], _doctag_indexes[j], _alpha, _work, next_random,
-                                                             _learn_doctags, _learn_hidden, _doctag_locks)
+                    # we reuse the DBOW function, as it is equivalent to skip-gram for this purpose
+                    next_random = fast_document_dbow_neg(negative, cum_table, cum_table_len, _word_vectors, syn1neg, size,
+                                                         indexes[i], indexes[j], _alpha, _work, next_random,
+                                                         _learn_words, _learn_hidden, _word_locks, adam_lr, adam_beta1, adam_beta2, adam_eps, adam_m, adam_v, adam_m2, adam_v2)
+
+        # docvec-training
+        for j in range(doctag_len):
+            if hs:
+                fast_document_dbow_hs(points[i], codes[i], codelens[i], _doctag_vectors, syn1, size, _doctag_indexes[j],
+                                      _alpha, _work, _learn_doctags, _learn_hidden, _doctag_locks, adam_lr, adam_beta1, adam_beta2, adam_eps, adam_m, adam_v, adam_m2, adam_v2)
+            if negative:
+                next_random = fast_document_dbow_neg(negative, cum_table, cum_table_len, _doctag_vectors, syn1neg, size,
+                                                         indexes[i], _doctag_indexes[j], _alpha, _work, next_random,
+                                                         _learn_doctags, _learn_hidden, _doctag_locks, adam_lr, adam_beta1, adam_beta2, adam_eps, adam_m, adam_v, adam_m2, adam_v2)
 
     return result
 

@@ -49,6 +49,7 @@ from timeit import default_timer
 from numpy import zeros, random, sum as np_sum, add as np_add, concatenate, \
     repeat as np_repeat, array, float32 as REAL, empty, ones, memmap as np_memmap, \
     sqrt, newaxis, ndarray, dot, vstack, dtype, divide as np_divide
+import numpy as np
 
 from gensim import utils, matutils  # utility fnc for pickling, common scipy operations etc
 from gensim.models.word2vec import Word2Vec, Vocab, train_cbow_pair, train_sg_pair, train_batch_sg
@@ -513,10 +514,10 @@ class Doctag(namedtuple('Doctag', 'offset, word_count, doc_count')):
 
 class Doc2Vec(Word2Vec):
     """Class for training, using and evaluating neural networks described in http://arxiv.org/pdf/1405.4053v2.pdf"""
-    def __init__(self, documents=None, size=300, alpha=0.025, window=8, min_count=5,
+    def __init__(self, documents=None, size=300, alpha=0.025, window=8, window_r=8, min_count=5,
                  max_vocab_size=None, sample=0, seed=1, workers=1, min_alpha=0.0001,
                  dm=1, hs=1, negative=0, dbow_words=0, dm_mean=0, dm_concat=0, dm_tag_count=1,
-                 docvecs=None, docvecs_mapfile=None, comment=None, trim_rule=None, **kwargs):
+                 docvecs=None, docvecs_mapfile=None, comment=None, trim_rule=None, adam_opt=None, split_token='___', random_learn_flag=0, **kwargs):
         """
         Initialize the model from an iterable of `documents`. Each document is a
         TaggedDocument object that will be used for training.
@@ -582,16 +583,43 @@ class Doc2Vec(Word2Vec):
             size=size, alpha=alpha, window=window, min_count=min_count, max_vocab_size=max_vocab_size,
             sample=sample, seed=seed, workers=workers, min_alpha=min_alpha,
             sg=(1+dm) % 2, hs=hs, negative=negative, cbow_mean=dm_mean,
-            null_word=dm_concat, **kwargs)
+            null_word=dm_concat, random_learn_flag=random_learn_flag, **kwargs)
         self.dbow_words = dbow_words
         self.dm_concat = dm_concat
         self.dm_tag_count = dm_tag_count
+        self.window_r = window_r
+
+        print 'window_r :', window_r
         if self.dm and self.dm_concat:
-            self.layer1_size = (self.dm_tag_count + (2 * self.window)) * self.vector_size
+            self.layer1_size = (self.dm_tag_count + (self.window + self.window_r)) * self.vector_size
         else:
             self.layer1_size = size
         self.docvecs = docvecs or DocvecsArray(docvecs_mapfile)
         self.comment = comment
+        self.split_token = split_token
+        self.adam_opt = adam_opt
+        self.adam_t = 0.0
+        self.adam_alpha_init = alpha
+        self.adam_lr = alpha
+        self.adam_t = 0.0
+
+        if adam_opt is not None:
+            self.adam_eps = adam_opt.get('eps', 1e-8)
+            self.adam_beta1 = adam_opt.get('beta1', 0.9)
+            self.adam_beta2 = adam_opt.get('beta2', 0.999)
+            # self.adam_m = zeros(self.layer1_size, dtype=REAL)
+            # self.adam_v = zeros(self.layer1_size, dtype=REAL)
+            # self.adam_m2 = zeros(self.layer1_size, dtype=REAL)
+            # self.adam_v2 = zeros(self.layer1_size, dtype=REAL)
+            self.adam_m = zeros(self.layer1_size, dtype=REAL)
+            self.adam_v = zeros(self.layer1_size, dtype=REAL)
+            self.adam_m2 = zeros(self.layer1_size, dtype=REAL)
+            self.adam_v2 = zeros(self.layer1_size, dtype=REAL)
+            # self.adam_m = np.array([zeros(1, dtype=REAL), zeros(1, dtype=REAL)])
+            # self.adam_v = np.array([zeros(1, dtype=REAL), zeros(1, dtype=REAL)])
+
+
+
         if documents is not None:
             self.build_vocab(documents, trim_rule=trim_rule)
             self.train(documents)
@@ -611,10 +639,25 @@ class Doc2Vec(Word2Vec):
     def reset_weights(self):
         if self.dm and self.dm_concat:
             # expand l1 size to match concatenated tags+words length
-            self.layer1_size = (self.dm_tag_count + (2 * self.window)) * self.vector_size
+            self.layer1_size = (self.dm_tag_count + (self.window + self.window_r)) * self.vector_size
             logger.info("using concatenative %d-dimensional layer1" % (self.layer1_size))
         super(Doc2Vec, self).reset_weights()
         self.docvecs.reset_weights(self)
+
+    def reset_weights_adam(self):
+        self.adam_doc_m = zeros(self.docvecs.doctag_syn0.shape, dtype=REAL)
+        self.adam_doc_v = zeros(self.docvecs.doctag_syn0.shape, dtype=REAL)
+
+        self.adam_word_m = zeros(self.syn0.shape, dtype=REAL)
+        self.adam_word_v = zeros(self.syn0.shape, dtype=REAL)
+
+        if self.hs:
+            self.adam_syn1_m = zeros((len(self.vocab), self.layer1_size), dtype=REAL)
+            self.adam_syn1_v = zeros((len(self.vocab), self.layer1_size), dtype=REAL)
+        if self.negative:
+            self.adam_syn1neg_m = zeros((len(self.vocab), self.layer1_size), dtype=REAL)
+            self.adam_syn1neg_v = zeros((len(self.vocab), self.layer1_size), dtype=REAL)
+
 
     def reset_from(self, other_model):
         """Reuse shareable structures from other_model."""
@@ -654,23 +697,42 @@ class Doc2Vec(Word2Vec):
         self.corpus_count = document_no + 1
         self.raw_vocab = vocab
 
+    # ___区切りでsentencesを作る
+    def split_to_sentence(self, doc):
+        start = 0
+        sentences = []
+        for _i, w in enumerate(doc):
+            if w == self.split_token:
+                sentences.append(doc[start:_i])
+                start = _i + 1
+        sentences.append(doc[start:_i])
+        return sentences
+
     def _do_train_job(self, job, alpha, inits):
         work, neu1 = inits
         tally = 0
+
         for doc in job:
             indexed_doctags = self.docvecs.indexed_doctags(doc.tags)
             doctag_indexes, doctag_vectors, doctag_locks, ignored = indexed_doctags
-            if self.sg:
-                tally += train_document_dbow(self, doc.words, doctag_indexes, alpha, work,
-                                             train_words=self.dbow_words,
-                                             doctag_vectors=doctag_vectors, doctag_locks=doctag_locks)
-            elif self.dm_concat:
-                tally += train_document_dm_concat(self, doc.words, doctag_indexes, alpha, work, neu1,
-                                                  doctag_vectors=doctag_vectors, doctag_locks=doctag_locks)
+            # ___を含むsentencesであればsplitする
+            if self.split_token in doc.words:
+                sentences = self.split_to_sentence(doc.words) # ___ごとにsentenceを分ける
             else:
-                tally += train_document_dm(self, doc.words, doctag_indexes, alpha, work, neu1,
-                                           doctag_vectors=doctag_vectors, doctag_locks=doctag_locks)
-            self.docvecs.trained_item(indexed_doctags)
+                sentences = [doc.words]
+
+            for sentence in sentences:
+                if self.sg:
+                    tally += train_document_dbow(self, sentence, doctag_indexes, alpha, work,
+                                                 train_words=self.dbow_words,
+                                                 doctag_vectors=doctag_vectors, doctag_locks=doctag_locks)
+                elif self.dm_concat:
+                    tally += train_document_dm_concat(self, sentence, doctag_indexes, alpha, work, neu1,
+                                                      doctag_vectors=doctag_vectors, doctag_locks=doctag_locks)
+                else:
+                    tally += train_document_dm(self, sentence, doctag_indexes, alpha, work, neu1,
+                                               doctag_vectors=doctag_vectors, doctag_locks=doctag_locks)
+                self.docvecs.trained_item(indexed_doctags)
         return tally, self._raw_word_count(job)
 
     def _raw_word_count(self, job):
@@ -708,6 +770,52 @@ class Doc2Vec(Word2Vec):
             alpha = ((alpha - min_alpha) / (steps - i)) + min_alpha
 
         return doctag_vectors[0]
+    def init_phrase_vectors(self, phrases):
+        phrase_num = len(phrases)
+        doctag_vectors = empty((phrase_num, self.vector_size), dtype=REAL)
+        for i in range(phrase_num):
+            doctag_vectors[i] = self.seeded_vector(' '.join(phrases[i]))
+        return doctag_vectors
+
+
+    def infer_vector_all(self, doctag_vectors, sentences, alpha=0.1, min_alpha=0.0001):
+        """
+            One iteration
+        """
+        
+        doctag_indexes = [0]
+        doctag_locks = ones(1, dtype=REAL)
+
+        for i, doc_words in enumerate(sentences):
+
+            doctag_vectors_ = empty((1, self.vector_size), dtype=REAL)
+            doctag_vectors_[0] = doctag_vectors[i]
+
+            # ___を含むsentencesであればsplitする
+            if self.split_token in doc_words:
+                sentences = self.split_to_sentence(doc_words) # ___ごとにsentenceを分ける
+            else:
+                sentences = [doc_words]
+
+            for sentence in sentences:
+                work = zeros(self.layer1_size, dtype=REAL)
+                if not self.sg:
+                    neu1 = matutils.zeros_aligned(self.layer1_size, dtype=REAL)
+                if self.sg:
+                    train_document_dbow(self, sentence, doctag_indexes, alpha, work,
+                                        learn_words=False, learn_hidden=False,
+                                        doctag_vectors=doctag_vectors_, doctag_locks=doctag_locks)
+                elif self.dm_concat:
+                    train_document_dm_concat(self, sentence, doctag_indexes, alpha, work, neu1,
+                                             learn_words=False, learn_hidden=False,
+                                             doctag_vectors=doctag_vectors_, doctag_locks=doctag_locks)
+                else:
+                    train_document_dm(self, sentence, doctag_indexes, alpha, work, neu1,
+                                      learn_words=False, learn_hidden=False,
+                                      doctag_vectors=doctag_vectors_, doctag_locks=doctag_locks)
+            doctag_vectors[i] = doctag_vectors_[0]
+            # alpha = ((alpha - min_alpha) / (steps - i)) + min_alpha
+        # return doctag_vectors
 
     def estimate_memory(self, vocab_size=None, report=None):
         """Estimate required memory for a model using current settings."""

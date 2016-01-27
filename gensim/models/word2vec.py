@@ -344,7 +344,7 @@ class Word2Vec(utils.SaveLoad):
             self, sentences=None, size=100, alpha=0.025, window=5, min_count=5,
             max_vocab_size=None, sample=0, seed=1, workers=1, min_alpha=0.0001,
             sg=1, hs=1, negative=0, cbow_mean=0, hashfxn=hash, iter=1, null_word=0,
-            trim_rule=None, sorted_vocab=1):
+            trim_rule=None, sorted_vocab=1, random_learn_flag=0):
         """
         Initialize the model from an iterable of `sentences`. Each sentence is a
         list of words (unicode strings) that will be used for training.
@@ -430,6 +430,7 @@ class Word2Vec(utils.SaveLoad):
         self.train_count = 0
         self.total_train_time = 0
         self.sorted_vocab = sorted_vocab
+        self.random_learn_flag = random_learn_flag
 
         if sentences is not None:
             if isinstance(sentences, GeneratorType):
@@ -738,7 +739,16 @@ class Word2Vec(utils.SaveLoad):
             pushed_words, pushed_examples = 0, 0
             next_alpha = self.alpha
 
-            for sent_idx, sentence in enumerate(sentences):
+
+            sentences_obj = enumerate(sentences)
+            if self.random_learn_flag == 1:
+                # ランダムソート
+                indexes_sentence_ids = array(range(len(sentences)))
+                random.shuffle(indexes_sentence_ids)
+                sentences_obj = [(index, sentences[index]) for index in indexes_sentence_ids]
+                # print '**random_learn_flag'
+
+            for sent_idx, sentence in sentences_obj:
                 sentence_length = self._raw_word_count([sentence])
 
                 # can we fit this sentence into the existing job batch?
